@@ -9,6 +9,7 @@ from utils.admin_config import is_admin
 CONFIG_FILE = os.path.join("config", "autopost_config.json")
 
 SCHEDULE_FILE = os.path.join("config", "autopost_schedule.json")
+MANGADEX_LAST_POST_FILE = os.path.join("config", "mangadex_last_post.json")
 
 MEME_URL = "https://meme-api.com/gimme"
 
@@ -23,20 +24,24 @@ class Autopost(commands.Cog):
         self.intervals = {}  # per guild schedule
 
         self.load_intervals()
+        self.last_mangadex_post_id = self.get_last_mangadex_post_id()
 
         self.meme_loop.change_interval(seconds=self.intervals.get("meme", 21600))
 
         self.quote_loop.change_interval(seconds=self.intervals.get("quote", 21600))
+        self.mangadex_loop.change_interval(seconds=self.intervals.get("mangadex", 1800))
 
         self.meme_loop.start()
 
         self.quote_loop.start()
+        self.mangadex_loop.start()
 
     def cog_unload(self):
 
         self.meme_loop.cancel()
 
         self.quote_loop.cancel()
+        self.mangadex_loop.cancel()
 
     def load_intervals(self):
 
@@ -47,12 +52,13 @@ class Autopost(commands.Cog):
                 data = json.load(f)
 
             self.intervals["meme"] = list(data.values())[0].get("meme", 21600)
-
             self.intervals["quote"] = list(data.values())[0].get("quote", 21600)
+            self.intervals["mangadex"] = list(data.values())[0].get("mangadex", 1800)
+
 
         else:
 
-            self.intervals = {"meme": 21600, "quote": 21600}
+            self.intervals = {"meme": 21600, "quote": 21600, "mangadex": 1800}
 
     def get_channel_id(self, guild_id, key):
 
@@ -77,6 +83,17 @@ class Autopost(commands.Cog):
                     return await resp.json()
 
         return None
+
+    def get_last_mangadex_post_id(self):
+        if not os.path.exists(MANGADEX_LAST_POST_FILE):
+            return None
+        with open(MANGADEX_LAST_POST_FILE) as f:
+            data = json.load(f)
+            return data.get("last_post_id")
+
+    def set_last_mangadex_post_id(self, post_id):
+        with open(MANGADEX_LAST_POST_FILE, "w") as f:
+            json.dump({"last_post_id": post_id}, f)
 
     @tasks.loop(seconds=21600)
 
@@ -156,95 +173,72 @@ class Autopost(commands.Cog):
 
                 await channel.send(embed=embed)
 
-    @is_admin()
+    @tasks.loop(minutes=30)
+    async def mangadex_loop(self):
+        await self.bot.wait_until_ready()
+        
+        # Fetch the latest chapters
+        url = "https://api.mangadex.org/chapter?limit=20&order[publishAt]=desc&translatedLanguage[]=en"
+        latest_chapters = await self.fetch_json(url)
+        if not latest_chapters or not latest_chapters.get("data"):
+            return
 
-    @app_commands.command(name="startautopost", description="▶️ Start auto-post loops manually")
+        # We process chapters oldest to newest to maintain order
+        for chapter_data in reversed(latest_chapters["data"]):
+            chapter_id = chapter_data["id"]
+            
+            # Avoid posting duplicates
+            if chapter_id == self.last_mangadex_post_id:
+                continue
 
-    async def startautopost(self, interaction: discord.Interaction):
+            # Fetch manga details
+            manga_id = next((rel["id"] for rel in chapter_data["relationships"] if rel["type"] == "manga"), None)
+            if not manga_id:
+                continue
+            
+            manga_details = await self.fetch_json(f"https://api.mangadex.org/manga/{manga_id}")
+            if not manga_details or not manga_details.get("data"):
+                continue
 
-        await interaction.response.defer(ephemeral=True)
+            manga_title = manga_details["data"]["attributes"]["title"].get("en", "Unknown Title")
+            
+            # Fetch cover art
+            cover_id = next((rel["id"] for rel in manga_details["data"]["relationships"] if rel["type"] == "cover_art"), None)
+            cover_filename = ""
+            if cover_id:
+                cover_details = await self.fetch_json(f"https://api.mangadex.org/cover/{cover_id}")
+                if cover_details and cover_details.get("data"):
+                    cover_filename = cover_details["data"]["attributes"]["fileName"]
 
-        if not self.meme_loop.is_running():
+            cover_url = f"https://uploads.mangadex.org/covers/{manga_id}/{cover_filename}" if cover_filename else None
 
-            self.meme_loop.start()
-
-        if not self.quote_loop.is_running():
-
-            self.quote_loop.start()
-
-        await interaction.followup.send("✅ Meme & quote loops started.")
-
-    @is_admin()
-
-    @app_commands.command(name="stopautopost", description="⏸️ Stop all auto-post loops")
-
-    async def stopautopost(self, interaction: discord.Interaction):
-
-        await interaction.response.defer(ephemeral=True)
-
-        if self.meme_loop.is_running():
-
-            self.meme_loop.cancel()
-
-        if self.quote_loop.is_running():
-
-            self.quote_loop.cancel()
-
-        await interaction.followup.send("⏸️ Auto-posting paused.")
-
-    @is_admin()
-
-    @app_commands.command(name="setinterval", description="⏱️ Set meme/quote post frequency")
-
-    @app_commands.describe(
-
-        meme_hours="Hours for meme post",
-
-        meme_minutes="Minutes for meme post",
-
-        quote_hours="Hours for quote post",
-
-        quote_minutes="Minutes for quote post"
-
-    )
-
-    async def setinterval(self, interaction: discord.Interaction,
-
-        meme_hours: int = 0, meme_minutes: int = 0,
-
-        quote_hours: int = 0, quote_minutes: int = 0):
-
-        await interaction.response.defer(ephemeral=True)
-
-        meme_secs = meme_hours * 3600 + meme_minutes * 60
-
-        quote_secs = quote_hours * 3600 + quote_minutes * 60
-
-        gid = str(interaction.guild.id)
-
-        data = {}
-
-        if os.path.exists(SCHEDULE_FILE):
-
-            with open(SCHEDULE_FILE) as f:
-
-                data = json.load(f)
-
-        data[gid] = {"meme": meme_secs, "quote": quote_secs}
-
-        with open(SCHEDULE_FILE, "w") as f:
-
-            json.dump(data, f, indent=2)
-
-        self.meme_loop.change_interval(seconds=meme_secs)
-
-        self.quote_loop.change_interval(seconds=quote_secs)
-
-        await interaction.followup.send(
-
-            f"✅ Intervals updated:\n• Meme: {meme_hours}h {meme_minutes}m\n• Quote: {quote_hours}h {quote_minutes}m"
-
-        )
+            # Prepare embed
+            chapter_title = chapter_data["attributes"]["title"]
+            chapter_num = chapter_data["attributes"]["chapter"]
+            chapter_url = f"https://mangadex.org/chapter/{chapter_id}"
+            
+            embed = discord.Embed(
+                title=f"New Chapter: {manga_title} - Ch. {chapter_num}",
+                description=f"**Title:** {chapter_title}",
+                url=chapter_url,
+                color=discord.Color.blue()
+            )
+            if cover_url:
+                embed.set_thumbnail(url=cover_url)
+            embed.set_footer(text="Posted from MangaDex")
+            
+            # Post to all configured guilds
+            for guild in self.bot.guilds:
+                cid = self.get_channel_id(guild.id, "mangadex_channel")
+                if not cid:
+                    continue
+                channel = guild.get_channel(cid)
+                if channel:
+                    await channel.send(embed=embed)
+            
+            # Update the last post ID to avoid re-posting
+            self.set_last_mangadex_post_id(chapter_id)
+            self.last_mangadex_post_id = chapter_id
 
 async def setup(bot):
 
